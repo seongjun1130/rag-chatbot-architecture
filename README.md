@@ -700,49 +700,114 @@ return sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ
 
 
 ## 8. 핵심 API 명세 및 데이터 파이프라인
-- **`POST /weaviate/insert-pdf/:companyName`**  
-  - **개요**: PDF 문서를 페이지 단위로 청킹·임베딩해 Weaviate에 저장  
-  - **Query Parameters**:
-    - `files` (multipart/form-data,**required**) : 삽입하려는 파일데이터
-  - **시나리오**:   
-- 1. **[클라이언트]**: PDF 파일 선택 후 `/weaviate/insert-pdf/:companyName`로 POST 요청  
-  1. **[서버]**: `multer`가 `uploads/` 폴더에 임시 저장  
-  2. **[서버]**: `pdfjsLib`로 페이지 단위 텍스트 추출  
-  3. **[서버]**: LangChain `RecursiveCharacterTextSplitter` 로 청킹 수행  
-  4. **[서버]**: 각 청크를 Weaviate에 임베딩하여 삽입  
-  5. **[서버]**: 원본 PDF를 S3에 업로드  
-  6. **[서버]**: 파일 메타정보 및 `companyName` 매핑 데이터, 요약정보를 RDB에 저장  
-  7. **[서버]**: 로컬 임시 파일 삭제 (`fs.unlink`)  
-  8. **[서버]**: 파일업로드 실패시 고아객체 추적 GC처리 로깅
-  ---
-- **`GET  /weaviate/companies/:companyId/search`**  
-  - **개요**: 질의어 기반 벡터 검색 수행 후 관련 청크 리스트 반환  
-  - **Query Parameters**: 
-    - `query`(string, **required**) : 검색할 질의어
-    - `fileIds`(string, optional) : 검색할 파일 ID 리스트 (ex : 1,2,3), 필드가 없을시 컬렉션내 모든 벡터데이터 검색 
-  - **시나리오**:  
-- 1. **[클라이언트]**: `companyId`, `fileIds`(단일 또는 쉼표 구분 다중), `query`(질의어)를 포함한 GET 요청  
-  1. **[서버]**: `companyId`와 `fileIds`의 유효성 검사 (회사·파일 PK 존재 여부 확인)  
-  2. **[서버]**: `fileIds` 미지정 → 모든 파일(default) 대상으로 검색  
-  3. **[서버]**: Weaviate `nearText` + `file_id` 필터링으로 벡터 검색 수행  
-  4. **[서버]**: 검색 결과(청크) 응답  
-  5. **[서버]**: 청크가 없을 경우 → LLM 요약 반환  
-     - **단일 파일**: 해당 파일의 요약 문자열  
-     - **다중 파일**: 선택된 파일별 요약 문자열 리스트  
-     - **전체 검색**: 컬렉션 내 모든 파일의 요약 리스트  
+
+### 8.1 이기종 데이터 저장소 매핑 아키텍처 (RDB ↔ S3 ↔ Vector DB)
+본 시스템은 원본 문서, 메타데이터, 의미 기반 청크(Chunk)를 각각의 특성에 맞는 저장소에 분산 적재. 데이터 파편화 및 고아 객체(Orphan Object) 발생을 방지하기 위해 RDB를 기준으로 강한 결합(Mapping)을 유지.
+<p align="center">
+ <img src="https://github.com/user-attachments/assets/4265b7eb-fb43-4e6e-b6b7-4f50ad8fcf59" width="600">
+</p>
+
+
+| 데이터 타입 | 담당 저장소 | 매핑 식별자 (Foreign Key Role) | 역할 및 특징 |
+| :--- | :--- | :--- | :--- |
+| **메타데이터** | **MySQL (RDB)** | `id` (Primary Key) | 전체 데이터의 기준점. 삭제 플래그(`scheduled_delete`) 및 상태 관리 |
+| **원본 파일** | **AWS S3** | RDB의 `stored_name` = S3 `Object Key` | 파싱 전 원본 PDF 파일의 영구 보관소 |
+| **벡터 청크** | **Weaviate** | RDB의 `company_id` = 메타데이터 | LLM 컨텍스트 주입을 위한 임베딩 데이터. 회사 및 파일 단위 필터링 수행 |
+
+#### 💡 데이터 정합성 방어 로직 (Dead-Letter GC)
+단순한 삭제 로직을 넘어, 이기종 저장소 간의 삭제 정합성을 보장하기 위해 `deleted_candidates` 테이블을 별도로 모델링 함.
+1. **Soft Delete & Lock:** 유저의 삭제 요청 시 DB 레코드부터 비관적 락(Pessimistic Lock)을 걸어 동시성 충돌을 차단하고 `scheduled_delete = true`로 상태만 변경.
+2. **비동기 GC 스케줄러:** 매시 정각 및 자정에 스케줄러가 돌며 S3의 원본 파일과 Weaviate의 벡터 데이터를 Hard Delete 시행.
+3. **Dead-Letter Queue:** 네트워크 단절 등으로 외부 저장소 삭제가 실패할 경우, 해당 테이블에 에러 로그와 `retry_count`를 누적하여 데이터 정합성이 깨지는 것을 시스템 레벨에서 원천 차단했음.
+
 ---
 
+### 8.2 핵심 API 명세 및 파이프라인 시나리오
+
+- **`POST /weaviate/insert-pdf/:companyName`**  
+  - **개요**: PDF 문서를 페이지 단위로 청킹·임베딩해 Weaviate에 저장  
+  - **Request Body**:
+    - `files` (multipart/form-data, **required**) : 삽입하려는 파일데이터
+  - **시나리오**:   
+    1. **[클라이언트]**: PDF 파일 선택 후 `/weaviate/insert-pdf/:companyName`로 POST 요청  
+    2. **[서버]**: `multer`가 `uploads/` 폴더에 임시 저장  
+    3. **[서버]**: `pdfjsLib`로 페이지 단위 텍스트 추출  
+    4. **[서버]**: LangChain `RecursiveCharacterTextSplitter` 로 청킹 수행  
+    5. **[서버]**: 각 청크를 Weaviate에 임베딩하여 삽입  
+    6. **[서버]**: 원본 PDF를 S3에 업로드  
+    7. **[서버]**: 파일 메타정보 및 `companyName` 매핑 데이터, 요약정보를 RDB에 저장  
+    8. **[서버]**: 로컬 임시 파일 삭제 (`fs.unlink`)  
+    9. **[서버]**: 파일업로드 실패시 고아객체 추적 GC처리 로깅
+  - **Response [201 Created]**: 다중 파일 업로드 처리 결과 배열 반환
+    ```json
+    [
+      {
+        "Url": "2025%EB%85%84%EB%B0%A9%ED%95%99%EC%9D%B8%ED%84%턴.pdf",
+        "result": "✅ Inserted chunks from 2025년방학인턴"
+      },
+      {
+        "Url": "company_overview.pdf",
+        "result": "✅ Inserted chunks from company_overview"
+      }
+    ]
+    ```
+
+---
+
+- **`GET /weaviate/companies/:companyId/search`**  
+  - **개요**: 질의어 기반 벡터 검색 수행 후 관련 청크 리스트 반환  
+  - **Query Parameters**: 
+    - `query` (string, **required**) : 검색할 질의어
+    - `fileIds` (string, optional) : 검색할 파일 ID 리스트 (ex : 1,2,3), 필드가 없을시 컬렉션내 모든 벡터데이터 검색 
+  - **시나리오**:  
+    1. **[클라이언트]**: `companyId`, `fileIds`(단일 또는 쉼표 구분 다중), `query`(질의어)를 포함한 GET 요청  
+    2. **[서버]**: `companyId`와 `fileIds`의 유효성 검사 (회사·파일 PK 존재 여부 확인)  
+    3. **[서버]**: `fileIds` 미지정 → 모든 파일(default) 대상으로 검색  
+    4. **[서버]**: Weaviate `nearText` + `file_id` 필터링으로 벡터 검색 수행  
+    5. **[서버]**: 검색 결과(청크) 응답  
+    6. **[서버]**: 청크가 없을 경우 → LLM 요약 반환  
+       - **단일 파일**: 해당 파일의 요약 문자열  
+       - **다중 파일**: 선택된 파일별 요약 문자열 리스트  
+       - **전체 검색**: 컬렉션 내 모든 파일의 요약 리스트
+  - **Response [200 OK] - 정상 답변 생성 시**:
+    ```json
+    {
+      "message": "대학생 인턴사업의 근무기간은 다음과 같습니다:\n\n- 1기: 2025년 7월 7일(월)부터 7월 31일(목)까지\n- 2기: 2025년 8월 4일(월)부터 8월 29일(금)까지",
+      "source": [
+        {
+          "source_url": "2025년+여름방학+대학생+인턴사업+참여자+모집+공고.pdf",
+          "source_index": 1
+        }
+      ]
+    }
+    ```
+  - **Response [200 OK] - 질의 관련 정보가 없을 시 (Fallback)**:
+    ```json
+    {
+      "message": "XX소프트 본사 위치라는 정보를 찾을 수 없습니다.\n해당 파일들의 개요:\n",
+      "results": [
+        {
+          "fileName": "2025년+여름방학+대학생+인턴사업+참여자+모집+공고.pdf",
+          "summary": "평택시에서는 2025년 여름방학에 대학생을 대상으로 인턴사업 참여자를 모집하고 있습니다..."
+        }
+      ]
+    }
+    ```
+
+---
 
 - **`DELETE /weaviate/companies/:companyId`**  
   - **개요**: 컬렉션(회사) 단위 소프트 딜리트 예약 및 최종 하드 딜리트  
   - **시나리오**:
-  1. **[유저]**: 특정 `companyId`의 컬렉션 삭제 요청 (`DELETE /weaviate/companies/:companyId`)  
-  2. **[서버]**: `CompanyRepo.findById(companyId)`로 회사 엔티티 조회  
-  3. **[서버]**: 이미 삭제 예약(`scheduledDelete=true`)되어 있으면 400 에러 반환  
-  4. **[서버]**: `UploadedFileService.getStoredNamesByCompanyId(companyId)`로 S3 키 목록 조회  
-  5. **[서버]**: `DeletedCandidate.create({ deleteType: 'collection', s3Key: 목록, ... })`로 GC 후보 테이블에 기록  
-  6. **[서버]**: 회사 엔티티 `scheduledDelete` 플래그를 `true`로 업데이트  
-  7. **[서버]**: 성공 응답(204 No Content) 반환  
+    1. **[유저]**: 특정 `companyId`의 컬렉션 삭제 요청 (`DELETE /weaviate/companies/:companyId`)  
+    2. **[서버]**: `CompanyRepo.findById(companyId)`로 회사 엔티티 조회  
+    3. **[서버]**: 이미 삭제 예약(`scheduledDelete=true`)되어 있으면 400 에러 반환  
+    4. **[서버]**: `UploadedFileService.getStoredNamesByCompanyId(companyId)`로 S3 키 목록 조회  
+    5. **[서버]**: `DeletedCandidate.create({ deleteType: 'collection', s3Key: 목록, ... })`로 GC 후보 테이블에 기록  
+    6. **[서버]**: 회사 엔티티 `scheduledDelete` 플래그를 `true`로 업데이트  
+    7. **[서버]**: 성공 응답(204 No Content) 반환  
+  - **Response [204 No Content]**:
+    *(반환 데이터 없음)*
 
  
 ## 9. 시스템 고도화 및 확장 전략
