@@ -703,8 +703,10 @@ return sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ
 
 ### 8.1 이기종 데이터 저장소 매핑 아키텍처 (RDB ↔ S3 ↔ Vector DB)
 본 시스템은 원본 문서, 메타데이터, 의미 기반 청크(Chunk)를 각각의 특성에 맞는 저장소에 분산 적재. 데이터 파편화 및 고아 객체(Orphan Object) 발생을 방지하기 위해 RDB를 기준으로 강한 결합(Mapping)을 유지.
+
+
 <p align="center">
- <img src="https://github.com/user-attachments/assets/f9b62b0a-4cfb-4a01-818f-d21e42bf35ff" width="600">
+  <img src="https://github.com/user-attachments/assets/513b95b3-3304-4be2-9890-909121e94b77" width="500">
 </p>
 
 
