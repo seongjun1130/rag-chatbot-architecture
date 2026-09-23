@@ -704,9 +704,6 @@ return sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ
 ### 8.1 이기종 데이터 저장소 매핑 아키텍처 (RDB ↔ S3 ↔ Vector DB)
 본 시스템은 원본 문서, 메타데이터, 의미 기반 청크(Chunk)를 각각의 특성에 맞는 저장소에 분산 적재. 데이터 파편화 및 고아 객체(Orphan Object) 발생을 방지하기 위해 RDB를 기준으로 강한 결합(Mapping)을 유지.
 
-<img width="760" height="719" alt="dddd" src="https://github.com/user-attachments/assets/24167158-311a-448c-9619-d8ba249e9ec0" />
-
-
 | 데이터 타입 | 담당 저장소 | 매핑 식별자 (Foreign Key Role) | 역할 및 특징 |
 | :--- | :--- | :--- | :--- |
 | **메타데이터** | **MySQL (RDB)** | `id` (Primary Key) | 전체 데이터의 기준점. 삭제 플래그(`scheduled_delete`) 및 상태 관리 |
