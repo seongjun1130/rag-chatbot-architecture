@@ -705,9 +705,7 @@ return sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ
 본 시스템은 원본 문서, 메타데이터, 의미 기반 청크(Chunk)를 각각의 특성에 맞는 저장소에 분산 적재. 데이터 파편화 및 고아 객체(Orphan Object) 발생을 방지하기 위해 RDB를 기준으로 강한 결합(Mapping)을 유지.
 
 
-<p align="center">
-  <img width="760" height="719" alt="Image" src="https://github.com/user-attachments/assets/f24dd282-9778-4ec6-a50b-1bcfdfeebcca" />
-</p>
+![ERD](https://github.com/user-attachments/assets/84c60687-eb52-4231-8ffa-507296c1b56c) <br>
 
 
 | 데이터 타입 | 담당 저장소 | 매핑 식별자 (Foreign Key Role) | 역할 및 특징 |
