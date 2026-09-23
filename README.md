@@ -706,7 +706,7 @@ return sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ
 
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/513b95b3-3304-4be2-9890-909121e94b77" width="500">
+  <img src="https://github.com/user-attachments/assets/f24dd282-9778-4ec6-a50b-1bcfdfeebcca" width="500">
 </p>
 
 
